@@ -139,6 +139,24 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # OATS diagnostic logging configuration
+  oats_diagnostics:
+
+    # Whether to write rollout summaries and token-level diagnostic snapshots
+    enable: False
+
+    # Output directory for OATS diagnostics; defaults to ${trainer.default_local_dir}/oats_diagnostics if null
+    output_dir: null
+
+    # Training steps at which token-level snapshots are saved
+    snapshot_steps: [0, 10, 25, 50, 100, 200]
+
+    # Number of prompt groups to include in each token-level snapshot; all rollouts are retained
+    snapshot_prompt_count: 64
+
+    # Treat the first training batch before any optimizer update as diagnostic step 0
+    include_step_zero: True
+
   # Number of nodes used in the training
   nnodes: 1
 

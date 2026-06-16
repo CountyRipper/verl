@@ -545,6 +545,296 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
+    def _oats_diagnostics_config(self):
+        return self.config.trainer.get("oats_diagnostics", None)
+
+    def _oats_diagnostics_enabled(self) -> bool:
+        cfg = self._oats_diagnostics_config()
+        return bool(cfg and cfg.get("enable", False))
+
+    def _oats_diagnostics_output_dir(self, cfg) -> str:
+        output_dir = cfg.get("output_dir", None)
+        if output_dir is None or str(output_dir).lower() in ("", "none", "null"):
+            output_dir = os.path.join(self.config.trainer.default_local_dir, "oats_diagnostics")
+        return str(output_dir)
+
+    def _oats_snapshot_steps(self, cfg) -> set[int]:
+        steps = cfg.get("snapshot_steps", [0, 10, 25, 50, 100, 200])
+        if isinstance(steps, str):
+            steps = steps.strip()
+            if steps.startswith("[") and steps.endswith("]"):
+                steps = steps[1:-1]
+            steps = [step.strip() for step in steps.split(",") if step.strip()]
+        else:
+            steps = OmegaConf.to_container(steps, resolve=True) if OmegaConf.is_config(steps) else list(steps)
+        return {int(step) for step in steps}
+
+    def _oats_snapshot_step_label(self) -> Optional[int]:
+        cfg = self._oats_diagnostics_config()
+        if not cfg or not cfg.get("enable", False):
+            return None
+        snapshot_steps = self._oats_snapshot_steps(cfg)
+        include_step_zero = cfg.get("include_step_zero", True)
+        if include_step_zero and self.global_steps == 1 and 0 in snapshot_steps:
+            return 0
+        if self.global_steps in snapshot_steps:
+            return int(self.global_steps)
+        return None
+
+    @staticmethod
+    def _oats_write_json(path: str, payload: dict):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, ensure_ascii=False, default=str)
+            f.write("\n")
+        os.replace(tmp_path, path)
+
+    @staticmethod
+    def _oats_write_jsonl(path: str, rows: list[dict]):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        os.replace(tmp_path, path)
+
+    def _oats_prompt_and_rollout_ids(self, batch: DataProto) -> tuple[np.ndarray, np.ndarray]:
+        batch_size = len(batch)
+        prompt_ids = batch.non_tensor_batch.get("oats_prompt_id", None)
+        rollout_ids = batch.non_tensor_batch.get("oats_rollout_id", None)
+
+        if prompt_ids is None:
+            uid_to_prompt_id = {}
+            prompt_id_values = []
+            for uid in batch.non_tensor_batch.get("uid", np.arange(batch_size, dtype=object)):
+                uid_key = str(uid)
+                if uid_key not in uid_to_prompt_id:
+                    uid_to_prompt_id[uid_key] = len(uid_to_prompt_id)
+                prompt_id_values.append(uid_to_prompt_id[uid_key])
+            prompt_ids = np.asarray(prompt_id_values, dtype=np.int64)
+        else:
+            prompt_ids = np.asarray(prompt_ids, dtype=np.int64)
+
+        if rollout_ids is None:
+            counts: dict[int, int] = defaultdict(int)
+            rollout_id_values = []
+            for prompt_id in prompt_ids:
+                prompt_id_int = int(prompt_id)
+                rollout_id_values.append(counts[prompt_id_int])
+                counts[prompt_id_int] += 1
+            rollout_ids = np.asarray(rollout_id_values, dtype=np.int64)
+        else:
+            rollout_ids = np.asarray(rollout_ids, dtype=np.int64)
+
+        return prompt_ids, rollout_ids
+
+    @staticmethod
+    def _oats_masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.to(values.dtype)
+        denom = mask.sum(dim=-1).clamp_min(1.0)
+        return (values * mask).sum(dim=-1) / denom
+
+    def _oats_log_rollout_summary(self, batch: DataProto) -> dict[str, float]:
+        cfg = self._oats_diagnostics_config()
+        output_dir = self._oats_diagnostics_output_dir(cfg)
+        step = int(self.global_steps)
+
+        prompt_ids, rollout_ids = self._oats_prompt_and_rollout_ids(batch)
+        response_mask = batch.batch["response_mask"].detach().cpu()
+        response_len = batch.batch["responses"].shape[-1]
+        response_attention_mask = batch.batch["attention_mask"][:, -response_len:].detach().cpu()
+        token_level_scores = batch.batch["token_level_scores"].detach().cpu()
+        old_log_probs = batch.batch["old_log_probs"].detach().cpu()
+        advantages = batch.batch["advantages"].detach().cpu()
+
+        rewards = token_level_scores.sum(dim=-1).float()
+        response_lengths = response_attention_mask.sum(dim=-1).long()
+        num_valid_tokens = response_mask.sum(dim=-1).long()
+        mean_old_logprob = self._oats_masked_mean(old_log_probs.float(), response_mask).float()
+        mean_advantage = self._oats_masked_mean(advantages.float(), response_mask).float()
+
+        correctness_source = rewards
+        if "acc" in batch.non_tensor_batch and len(batch.non_tensor_batch["acc"]) == len(batch):
+            with np.errstate(invalid="ignore"):
+                correctness_source = torch.tensor(
+                    np.asarray(batch.non_tensor_batch["acc"], dtype=np.float32), dtype=torch.float32
+                )
+        is_correct = correctness_source > 0
+
+        rows = []
+        per_query_rewards: dict[int, list[float]] = defaultdict(list)
+        for i in range(len(batch)):
+            prompt_id = int(prompt_ids[i])
+            reward = float(rewards[i].item())
+            per_query_rewards[prompt_id].append(reward)
+            rows.append(
+                {
+                    "step": step,
+                    "prompt_id": prompt_id,
+                    "rollout_id": int(rollout_ids[i]),
+                    "reward": reward,
+                    "advantage": float(mean_advantage[i].item()),
+                    "is_correct": bool(is_correct[i].item()),
+                    "response_length": int(response_lengths[i].item()),
+                    "mean_old_logprob": float(mean_old_logprob[i].item()),
+                    "num_valid_tokens": int(num_valid_tokens[i].item()),
+                }
+            )
+
+        query_count = len(per_query_rewards)
+        if query_count > 0:
+            all_wrong = 0
+            all_correct = 0
+            usable = 0
+            for query_rewards in per_query_rewards.values():
+                positives = [reward > 0 for reward in query_rewards]
+                if all(positives):
+                    all_correct += 1
+                if not any(positives):
+                    all_wrong += 1
+                if any(positives) and not all(positives):
+                    usable += 1
+            rollout_rewards = np.asarray([row["reward"] for row in rows], dtype=np.float32)
+            positive_rollout_ratio = float(np.mean(rollout_rewards > 0)) if rollout_rewards.size else 0.0
+            negative_rollout_ratio = float(np.mean(rollout_rewards <= 0)) if rollout_rewards.size else 0.0
+            query_metrics = {
+                "step": step,
+                "num_queries": query_count,
+                "num_rollouts": len(rows),
+                "usable_query_ratio": usable / query_count,
+                "all_wrong_query_ratio": all_wrong / query_count,
+                "all_correct_query_ratio": all_correct / query_count,
+                "positive_rollout_ratio": positive_rollout_ratio,
+                "negative_rollout_ratio": negative_rollout_ratio,
+            }
+        else:
+            query_metrics = {
+                "step": step,
+                "num_queries": 0,
+                "num_rollouts": 0,
+                "usable_query_ratio": 0.0,
+                "all_wrong_query_ratio": 0.0,
+                "all_correct_query_ratio": 0.0,
+                "positive_rollout_ratio": 0.0,
+                "negative_rollout_ratio": 0.0,
+            }
+
+        self._oats_write_jsonl(os.path.join(output_dir, "rollout_summary", f"step_{step:06d}.jsonl"), rows)
+        self._oats_write_json(
+            os.path.join(output_dir, "query_distribution", f"step_{step:06d}.json"), query_metrics
+        )
+
+        return {
+            "oats/usable_query_ratio": query_metrics["usable_query_ratio"],
+            "oats/all_wrong_query_ratio": query_metrics["all_wrong_query_ratio"],
+            "oats/all_correct_query_ratio": query_metrics["all_correct_query_ratio"],
+            "oats/positive_rollout_ratio": query_metrics["positive_rollout_ratio"],
+            "oats/negative_rollout_ratio": query_metrics["negative_rollout_ratio"],
+        }
+
+    def _oats_select_snapshot_indices(self, batch: DataProto) -> list[int]:
+        cfg = self._oats_diagnostics_config()
+        prompt_limit = int(cfg.get("snapshot_prompt_count", 64))
+        prompt_ids, _ = self._oats_prompt_and_rollout_ids(batch)
+        selected_prompt_ids = set()
+        selected_indices = []
+        for idx, prompt_id in enumerate(prompt_ids):
+            prompt_id = int(prompt_id)
+            if prompt_id not in selected_prompt_ids:
+                if prompt_limit > 0 and len(selected_prompt_ids) >= prompt_limit:
+                    continue
+                selected_prompt_ids.add(prompt_id)
+            if prompt_id in selected_prompt_ids:
+                selected_indices.append(idx)
+        return selected_indices
+
+    def _oats_build_logprob_forward_batch(self, batch: DataProto) -> DataProto:
+        required_keys = ["input_ids", "prompts", "responses", "attention_mask", "position_ids", "response_mask"]
+        batch_keys = [key for key in required_keys if key in batch.batch]
+        missing_keys = sorted(set(required_keys) - set(batch_keys))
+        if missing_keys:
+            raise KeyError(f"OATS diagnostics missing logprob forward keys: {missing_keys}")
+        return batch.select(batch_keys=batch_keys, non_tensor_batch_keys=[], deepcopy=False)
+
+    def _oats_compute_actor_log_probs(self, batch: DataProto) -> torch.Tensor:
+        batch_td = batch.to_tensordict()
+        batch_td = left_right_2_no_padding(batch_td)
+        tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False)
+        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        log_probs = tu.get(output, "log_probs")
+        log_probs = no_padding_2_padding(log_probs, batch_td)
+        return log_probs.float()
+
+    def _oats_prepare_token_snapshot(
+        self, batch: DataProto, entropys: torch.Tensor, step_label: int
+    ) -> Optional[dict[str, Any]]:
+        selected_indices = self._oats_select_snapshot_indices(batch)
+        if not selected_indices:
+            return None
+
+        selected_batch = batch.select_idxs(selected_indices)
+        selected_entropy = entropys[selected_indices].detach().cpu().float()
+        prompt_ids, rollout_ids = self._oats_prompt_and_rollout_ids(selected_batch)
+        response_mask = selected_batch.batch["response_mask"].detach().cpu()
+        response_len = selected_batch.batch["responses"].shape[-1]
+        response_attention_mask = selected_batch.batch["attention_mask"][:, -response_len:].detach().cpu()
+        token_level_scores = selected_batch.batch["token_level_scores"].detach().cpu()
+
+        snapshot = {
+            "step": np.asarray(step_label, dtype=np.int64),
+            "global_step": np.asarray(int(self.global_steps), dtype=np.int64),
+            "selected_indices": np.asarray(selected_indices, dtype=np.int64),
+            "prompt_id": prompt_ids.astype(np.int64),
+            "rollout_id": rollout_ids.astype(np.int64),
+            "uid": np.asarray(selected_batch.non_tensor_batch.get("uid", []), dtype=object),
+            "token_position": np.arange(response_len, dtype=np.int64),
+            "token_id": selected_batch.batch["responses"].detach().cpu().numpy(),
+            "reward": token_level_scores.sum(dim=-1).float().numpy(),
+            "advantage": selected_batch.batch["advantages"].detach().cpu().float().numpy(),
+            "old_logprob": selected_batch.batch["old_log_probs"].detach().cpu().float().numpy(),
+            "entropy": selected_entropy.numpy(),
+            "attention_mask": response_attention_mask.numpy(),
+            "response_mask": response_mask.numpy(),
+            "num_valid_tokens": response_mask.sum(dim=-1).long().numpy(),
+        }
+
+        return {
+            "step_label": int(step_label),
+            "snapshot": snapshot,
+            "forward_batch": self._oats_build_logprob_forward_batch(selected_batch),
+        }
+
+    def _oats_finalize_token_snapshot(self, cache: dict[str, Any]):
+        cfg = self._oats_diagnostics_config()
+        output_dir = self._oats_diagnostics_output_dir(cfg)
+        step_label = cache["step_label"]
+        snapshot = cache["snapshot"]
+
+        new_log_probs = self._oats_compute_actor_log_probs(cache["forward_batch"]).detach().cpu().float().numpy()
+        old_log_probs = snapshot["old_logprob"]
+        snapshot["new_logprob"] = new_log_probs
+        snapshot["delta_logp"] = new_log_probs - old_log_probs
+
+        snapshot_dir = os.path.join(output_dir, "token_snapshots")
+        os.makedirs(snapshot_dir, exist_ok=True)
+        final_path = os.path.join(snapshot_dir, f"step_{step_label:06d}.npz")
+        tmp_path = f"{final_path}.tmp"
+        with open(tmp_path, "wb") as f:
+            np.savez_compressed(f, **snapshot)
+        os.replace(tmp_path, final_path)
+
+        meta = {
+            "step": step_label,
+            "global_step": int(snapshot["global_step"]),
+            "num_rollouts": int(snapshot["prompt_id"].shape[0]),
+            "num_prompts": int(len(set(snapshot["prompt_id"].tolist()))),
+            "max_response_length": int(snapshot["token_id"].shape[-1]),
+            "format": "npz_compressed",
+            "arrays": sorted(snapshot.keys()),
+        }
+        self._oats_write_json(os.path.join(snapshot_dir, f"step_{step_label:06d}.json"), meta)
+
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
@@ -1431,13 +1721,17 @@ class RayPPOTrainer:
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                oats_diag_enabled = self._oats_diagnostics_enabled()
 
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
+                oats_prompt_ids = np.arange(len(batch), dtype=object) if oats_diag_enabled else None
 
                 gen_batch = self._get_gen_batch(batch)
+                if oats_diag_enabled:
+                    batch.non_tensor_batch["oats_prompt_id"] = oats_prompt_ids
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
@@ -1492,6 +1786,12 @@ class RayPPOTrainer:
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if oats_diag_enabled:
+                        rollout_ids = np.tile(
+                            np.arange(self.config.actor_rollout_ref.rollout.n, dtype=object),
+                            len(batch) // self.config.actor_rollout_ref.rollout.n,
+                        )
+                        batch.non_tensor_batch["oats_rollout_id"] = rollout_ids
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1521,6 +1821,9 @@ class RayPPOTrainer:
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
+                    old_entropys_for_diag = None
+                    oats_token_snapshot_cache = None
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1539,6 +1842,7 @@ class RayPPOTrainer:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
+                            old_entropys_for_diag = entropys
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
                             entropy_agg = agg_loss(
@@ -1629,6 +1933,21 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
+                    if oats_diag_enabled:
+                        with marked_timer("oats_rollout_summary", timing_raw, color="green"):
+                            metrics.update(self._oats_log_rollout_summary(batch))
+                            oats_step_label = self._oats_snapshot_step_label()
+                            if oats_step_label is not None:
+                                if old_entropys_for_diag is None:
+                                    print(
+                                        "Skipping OATS token snapshot because entropy was not computed. "
+                                        "Disable rollout-correction bypass mode for token snapshots."
+                                    )
+                                else:
+                                    oats_token_snapshot_cache = self._oats_prepare_token_snapshot(
+                                        batch, old_entropys_for_diag, oats_step_label
+                                    )
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -1644,6 +1963,10 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
+
+                        if oats_token_snapshot_cache is not None:
+                            with marked_timer("oats_new_logprob", timing_raw, color="blue"):
+                                self._oats_finalize_token_snapshot(oats_token_snapshot_cache)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
