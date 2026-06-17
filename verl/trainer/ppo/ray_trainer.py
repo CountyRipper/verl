@@ -559,7 +559,7 @@ class RayPPOTrainer:
         return str(output_dir)
 
     def _oats_snapshot_steps(self, cfg) -> set[int]:
-        steps = cfg.get("snapshot_steps", [0, 10, 25, 50, 100, 200])
+        steps = cfg.get("snapshot_steps", [0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200])
         if isinstance(steps, str):
             steps = steps.strip()
             if steps.startswith("[") and steps.endswith("]"):
