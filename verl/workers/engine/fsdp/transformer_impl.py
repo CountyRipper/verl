@@ -927,12 +927,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
+        return_delta_hidden = tu.get_non_tensor_data(data=micro_batch, key="return_delta_hidden", default=False)
         temperature = micro_batch["temperature"]
         temperature_item = temperature
         if use_fused_kernels:
             assert not isinstance(temperature, torch.Tensor), (
                 "use_fused_kernels does not support per sample temperature yet"
             )
+        if return_delta_hidden and use_fused_kernels:
+            raise NotImplementedError("DelTA hidden capture is not supported with use_fused_kernels=True")
         assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
 
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
@@ -946,7 +949,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         assert temperature.shape[0] == input_ids.shape[0]
 
         # args used to get outputs
-        output_args = {}
+        output_args = {"return_delta_hidden": return_delta_hidden}
 
         if use_remove_padding:
             # support per sample temperature
@@ -1076,6 +1079,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             data=micro_batch, key="calculate_sum_pi_squared", default=False
         )
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+        return_delta_hidden = bool(output_args.get("return_delta_hidden", False))
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1086,6 +1090,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         model_output = {}
 
         input_ids = micro_batch["input_ids"]
+        delta_hidden_states = None
 
         if use_remove_padding:
             input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
@@ -1174,6 +1179,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         unpad_dim=0,
                         padding_size=pad_size,
                     )
+                if return_delta_hidden:
+                    delta_hidden_rmpad = gather_outputs_and_unpad(
+                        output_args["delta_hidden_states_rmpad"],
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+            elif return_delta_hidden:
+                delta_hidden_rmpad = output_args["delta_hidden_states_rmpad"]
 
             if pad_mode == DatasetPadMode.NO_PADDING:
                 cu_seqlens = input_ids.offsets()
@@ -1183,6 +1197,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
                 if calculate_sum_pi_squared:
                     sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
+                if return_delta_hidden:
+                    delta_hidden_states = torch.nested.nested_tensor_from_jagged(delta_hidden_rmpad, cu_seqlens)
             else:
                 raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1242,6 +1258,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         )
                         sum_pi_squared_rmpad = torch.cat([t for t in sum_pi_squared.unbind()])
                         sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
+                    if return_delta_hidden:
+                        delta_hidden_states = torch.nested.narrow(
+                            output_args["delta_hidden_states_padded"], 1, starts, seq_lengths, layout=torch.jagged
+                        )
                 else:
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
@@ -1250,14 +1270,34 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_output["entropy"] = entropy
         if calculate_sum_pi_squared:
             model_output["sum_pi_squared"] = sum_pi_squared
+        if return_delta_hidden:
+            model_output["delta_hidden_states"] = delta_hidden_states
 
         return model_output
+
+    def _register_delta_hidden_hook(self):
+        captured_hidden = []
+
+        def capture_last_hidden(_module, args):
+            captured_hidden.append(args[0].detach())
+
+        hook_handle = None
+        for name, module in self.module.named_modules():
+            if name.split(".")[-1] == "lm_head" or name.endswith("lm_head"):
+                hook_handle = module.register_forward_pre_hook(capture_last_hidden)
+                break
+
+        if hook_handle is None:
+            raise RuntimeError("Failed to find 'lm_head'. Cannot capture DelTA hidden states.")
+
+        return hook_handle, captured_hidden
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        return_delta_hidden = bool(output_args.get("return_delta_hidden", False))
 
         # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
         # autocast is a no-op at best and a footgun at worst, so skip it entirely.
@@ -1270,10 +1310,31 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
-            raw_output = self.module(
-                **model_inputs,
-                use_cache=False,
-            )  # prevent model thinks we are generating
+            hook_handle = None
+            captured_hidden = None
+            if return_delta_hidden:
+                hook_handle, captured_hidden = self._register_delta_hidden_hook()
+
+            try:
+                raw_output = self.module(
+                    **model_inputs,
+                    use_cache=False,
+                )  # prevent model thinks we are generating
+            finally:
+                if hook_handle is not None:
+                    hook_handle.remove()
+
+            if return_delta_hidden:
+                if not captured_hidden:
+                    raise RuntimeError("DelTA hidden-state hook did not capture lm_head input.")
+                hidden_states = captured_hidden[0]
+                if output_args.get("return_delta_hidden", False):
+                    if tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True):
+                        if hidden_states.dim() == 3:
+                            hidden_states = hidden_states.squeeze(0)
+                        output_args["delta_hidden_states_rmpad"] = hidden_states
+                    else:
+                        output_args["delta_hidden_states_padded"] = hidden_states
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function

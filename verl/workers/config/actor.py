@@ -123,6 +123,11 @@ class ActorConfig(BaseConfig):
         loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
             If None, uses response_length. Set to a constant to ensure consistent normalization.
         entropy_coeff (float): Entropy coefficient for regularization.
+        enable_delta (bool): Whether to enable DelTA token-level advantage reweighting.
+        delta_K (int): Number of DelTA center-refinement iterations.
+        delta_lam_min (float): Lower bound for DelTA final token weights.
+        delta_lam_max (float): Upper bound for DelTA final token weights.
+        delta_impl (str): DelTA implementation variant. Supports 'Normal' and 'Memory_efficient'.
         tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
         tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
         use_kl_loss (bool): Whether to use KL divergence loss.
@@ -164,6 +169,11 @@ class ActorConfig(BaseConfig):
     loss_agg_mode: str = "token-mean"
     loss_scale_factor: Optional[int] = None
     entropy_coeff: float = 0
+    enable_delta: bool = False
+    delta_K: int = 1
+    delta_lam_min: float = 0.8
+    delta_lam_max: float = 1.2
+    delta_impl: str = "Normal"
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
@@ -218,6 +228,12 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.delta_lam_max < self.delta_lam_min:
+            raise ValueError(
+                f"delta_lam_max ({self.delta_lam_max}) must be >= delta_lam_min ({self.delta_lam_min})"
+            )
+        if self.delta_impl not in ["Normal", "Memory_efficient"]:
+            raise ValueError("delta_impl must be one of ['Normal', 'Memory_efficient']")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

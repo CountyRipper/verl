@@ -52,6 +52,7 @@ from verl.workers.config import (
     TrainingWorkerConfig,
 )
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
+from verl.workers.utils.delta import build_delta_weighted_advantages
 from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
@@ -653,6 +654,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        if self.config.actor.get("enable_delta", False):
+            delta_data = data.copy()
+            tu.assign_non_tensor(
+                delta_data,
+                compute_loss=False,
+                calculate_entropy=False,
+                return_delta_hidden=True,
+            )
+            delta_output = self.actor.infer_batch(data=delta_data)
+            if delta_output is not None:
+                delta_tensors, delta_metrics = build_delta_weighted_advantages(
+                    log_probs=tu.get(delta_output, "log_probs"),
+                    hidden_states=tu.get(delta_output, "delta_hidden_states"),
+                    data=data,
+                    num_iters=int(self.config.actor.get("delta_K", 1)),
+                    lam_min=float(self.config.actor.get("delta_lam_min", 0.8)),
+                    lam_max=float(self.config.actor.get("delta_lam_max", 1.2)),
+                    impl=str(self.config.actor.get("delta_impl", "Normal")),
+                )
+                for key, value in delta_tensors.items():
+                    data[key] = value
+                tu.assign_non_tensor(data, delta_metrics=delta_metrics)
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 

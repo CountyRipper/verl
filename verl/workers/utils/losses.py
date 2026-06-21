@@ -84,6 +84,12 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
+    if "delta_weighted_advantages" in data:
+        fields.append("delta_weighted_advantages")
+    if "delta_weights" in data:
+        fields.append("delta_weights")
+    if "delta_scores" in data:
+        fields.append("delta_scores")
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -93,8 +99,26 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
     old_log_prob = data["old_log_probs"]
-    advantages = data["advantages"]
+    advantages = data.get("delta_weighted_advantages", data["advantages"])
     rollout_is_weights = data.get("rollout_is_weights", None)
+
+    if "delta_weights" in data:
+        delta_weights = data["delta_weights"].float()
+        metrics["actor/delta_weight_mean"] = Metric(
+            value=masked_mean(delta_weights, response_mask), aggregation=AggregationType.MEAN
+        )
+        valid_weights = delta_weights[response_mask]
+        if valid_weights.numel() > 0:
+            metrics["actor/delta_weight_min"] = Metric(
+                value=valid_weights.min(), aggregation=AggregationType.MEAN
+            )
+            metrics["actor/delta_weight_max"] = Metric(
+                value=valid_weights.max(), aggregation=AggregationType.MEAN
+            )
+    if "delta_scores" in data:
+        metrics["actor/delta_score_mean"] = Metric(
+            value=masked_mean(data["delta_scores"].float(), response_mask), aggregation=AggregationType.MEAN
+        )
 
     loss_agg_mode = config.loss_agg_mode
 
