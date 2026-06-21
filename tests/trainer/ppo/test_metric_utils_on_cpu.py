@@ -28,6 +28,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+    process_validation_metrics_with_aggregate,
 )
 from verl.utils.metric import (
     reduce_metrics,
@@ -567,6 +568,23 @@ class TestProcessValidationMetrics(unittest.TestCase):
 
         # For bootstrap with n=2, the majority vote could be either A or B
         # depending on the random sampling, so we don't check the exact value
+
+    def test_process_validation_metrics_with_aggregate_source(self):
+        """Test aggregate validation metrics across multiple data sources."""
+        data_sources = ["aime2024", "math500", "math500"]
+        sample_inputs = ["prompt1", "prompt2", "prompt3"]
+        infos_dict = {
+            "acc": [1.0, 0.0, 1.0],
+        }
+
+        result = process_validation_metrics_with_aggregate(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertIn("aime2024", result)
+        self.assertIn("math500", result)
+        self.assertIn("all", result)
+        self.assertAlmostEqual(result["aime2024"]["acc"]["mean@1"], 1.0)
+        self.assertAlmostEqual(result["math500"]["acc"]["mean@1"], 0.5)
+        self.assertAlmostEqual(result["all"]["acc"]["mean@1"], 2.0 / 3.0)
 
 
 if __name__ == "__main__":

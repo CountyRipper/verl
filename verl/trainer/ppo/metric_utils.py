@@ -702,3 +702,26 @@ def process_validation_metrics(
             for metric_name, uid_vals in metric2uid_vals.items():
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
     return data_src2var2metric2val
+
+
+def process_validation_metrics_with_aggregate(
+    data_sources: list[str],
+    sample_uids: list[str],
+    infos_dict: dict[str, list[Any]],
+    seed: int = 42,
+    aggregate_source: str | None = "all",
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Process validation metrics per source and optionally as one aggregate source."""
+
+    result = process_validation_metrics(data_sources, sample_uids, infos_dict, seed=seed)
+    if not aggregate_source:
+        return result
+
+    unique_sources = {str(data_source) for data_source in data_sources}
+    if len(unique_sources) <= 1 or aggregate_source in result:
+        return result
+
+    aggregate_sources = [aggregate_source] * len(data_sources)
+    aggregate_result = process_validation_metrics(aggregate_sources, sample_uids, infos_dict, seed=seed)
+    result[aggregate_source] = aggregate_result[aggregate_source]
+    return result

@@ -92,6 +92,7 @@ class RLHFDataset(Dataset):
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
         max_samples: int = -1,
+        is_train: bool = True,
     ):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
@@ -101,6 +102,7 @@ class RLHFDataset(Dataset):
         self.tokenizer = tokenizer
         self.processor = processor
         self.max_samples = max_samples
+        self.is_train = is_train
         self.config = config
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
@@ -154,9 +156,16 @@ class RLHFDataset(Dataset):
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
+        self.validation_metric_source_key = config.get("validation_metric_source_key", "metric_data_source")
 
         self._download()
         self._read_files_and_tokenize()
+
+    @staticmethod
+    def _metric_source_from_path(data_file: str) -> str:
+        name = os.path.splitext(os.path.basename(os.fspath(data_file)))[0]
+        name = re.sub(r"[^0-9A-Za-z_.-]+", "_", name).strip("_")
+        return name or "unknown"
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -175,6 +184,15 @@ class RLHFDataset(Dataset):
                 dataframe = datasets.load_dataset("json", data_files=parquet_file)["train"]
             else:
                 raise ValueError(f"Unsupported file format: {parquet_file}")
+            if (
+                not self.is_train
+                and self.validation_metric_source_key
+                and self.validation_metric_source_key not in dataframe.column_names
+            ):
+                metric_source = self._metric_source_from_path(parquet_file)
+                dataframe = dataframe.add_column(
+                    self.validation_metric_source_key, [metric_source] * len(dataframe)
+                )
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
@@ -539,6 +557,7 @@ class RLHFDataset(Dataset):
                 config=self.config,
                 processor=self.processor,
                 max_samples=self.max_samples,
+                is_train=self.is_train,
             )
             split_dataset.dataframe = split_dataframe
             split_dataset.serialize_dataset = self.serialize_dataset

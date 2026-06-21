@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import warnings
 from enum import Enum
 
@@ -126,13 +127,16 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     dataset_cls = get_dataset_class(data_config)
 
     # Instantiate the dataset using the determined dataset class
-    dataset = dataset_cls(
+    dataset_kwargs = dict(
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,
         config=data_config,
         max_samples=max_samples,
     )
+    if "is_train" in inspect.signature(dataset_cls).parameters:
+        dataset_kwargs["is_train"] = is_train
+    dataset = dataset_cls(**dataset_kwargs)
 
     return dataset
 

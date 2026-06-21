@@ -29,6 +29,15 @@ prompt_key: prompt
 # The field used to select the reward function (if using different ones per example).
 reward_fn_key: data_source
 
+# Validation-only field used to group metrics. This intentionally differs from
+# reward_fn_key so reward routing can keep using coarse labels such as
+# "math_dapo" while TensorBoard metrics are split by parquet/dataset.
+validation_metric_source_key: metric_data_source
+
+# Validation aggregate metric source. Set to null/false to disable
+# val-core/all/... and val-aux/all/... metrics.
+validation_metric_aggregate_source: all
+
 # Maximum prompt length. All prompts will be left-padded to this length.
 # An error will be reported if the length is too long.
 # oc.select: default val for rollout.prompt_length

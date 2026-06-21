@@ -46,7 +46,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
-    process_validation_metrics,
+    process_validation_metrics_with_aggregate,
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
@@ -860,7 +860,9 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        metric_source_key = self.config.data.get("validation_metric_source_key", "metric_data_source")
+        reward_key_candidates = {"data_source", "reward_model", "extra_info", "uid", metric_source_key}
+        reward_keys = reward_key_candidates & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -978,7 +980,11 @@ class RayPPOTrainer:
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            metric_source_key = self.config.data.get("validation_metric_source_key", "metric_data_source")
+            metric_sources = test_batch.non_tensor_batch.get(metric_source_key)
+            if metric_sources is None:
+                metric_sources = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+            data_source_lst.append(metric_sources)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -1009,7 +1015,10 @@ class RayPPOTrainer:
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        aggregate_source = self.config.data.get("validation_metric_aggregate_source", "all")
+        data_src2var2metric2val = process_validation_metrics_with_aggregate(
+            data_sources, sample_uids, reward_extra_infos_dict, aggregate_source=aggregate_source
+        )
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"

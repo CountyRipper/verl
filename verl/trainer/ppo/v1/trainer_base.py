@@ -53,7 +53,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
-    process_validation_metrics,
+    process_validation_metrics_with_aggregate,
 )
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics
@@ -775,8 +775,16 @@ class PPOTrainer(ABC):
             all_inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["prompts"]]
             all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
 
+            metric_source_key = self.config.data.get("validation_metric_source_key", "metric_data_source")
             fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
-            data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
+            if metric_source_key not in fields:
+                fields.append(metric_source_key)
+            try:
+                data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
+            except KeyError:
+                logger.warning("Validation metric source field %s is unavailable; falling back to data_source.", metric_source_key)
+                fields = [field for field in fields if field != metric_source_key]
+                data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
 
             sample_uids.extend(data.pop("uid").tolist())
             sample_outputs.extend(all_outputs[i] for i in final_indices)
@@ -808,7 +816,9 @@ class PPOTrainer(ABC):
             else:
                 sample_gts.extend([None] * len(final_indices))
 
-            data_source = data.pop("data_source", None)
+            data_source = data.pop(metric_source_key, None)
+            if data_source is None:
+                data_source = data.pop("data_source", None)
             if data_source is not None:
                 data_sources.extend(data_source.tolist())
             else:
@@ -997,7 +1007,10 @@ class PPOTrainer(ABC):
             )
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        aggregate_source = self.config.data.get("validation_metric_aggregate_source", "all")
+        data_src2var2metric2val = process_validation_metrics_with_aggregate(
+            data_sources, sample_uids, reward_extra_infos_dict, aggregate_source=aggregate_source
+        )
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
