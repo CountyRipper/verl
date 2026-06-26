@@ -84,6 +84,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
+    if "oats_loss_weights" in data:
+        fields.append("oats_loss_weights")
     if "delta_weighted_advantages" in data:
         fields.append("delta_weighted_advantages")
     if "delta_weights" in data:
@@ -97,6 +99,16 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
+    loss_mask = response_mask
+    if "oats_loss_weights" in data:
+        oats_loss_weights = data["oats_loss_weights"].float()
+        loss_mask = response_mask.float() * oats_loss_weights
+        metrics["actor/oats_loss_weight_mean"] = Metric(
+            value=masked_mean(oats_loss_weights, response_mask), aggregation=AggregationType.MEAN
+        )
+        metrics["actor/oats_loss_weight_nonzero_ratio"] = Metric(
+            value=masked_mean((oats_loss_weights > 0).float(), response_mask), aggregation=AggregationType.MEAN
+        )
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data.get("delta_weighted_advantages", data["advantages"])
@@ -129,7 +141,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         old_log_prob=old_log_prob,
         log_prob=log_prob,
         advantages=advantages,
-        response_mask=response_mask,
+        response_mask=loss_mask,
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
@@ -146,7 +158,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     # add entropy loss
     if entropy is not None:
         entropy_loss = agg_loss(
-            loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+            loss_mat=entropy, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
         )
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
@@ -158,7 +170,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # compute kl loss
         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
         kl_loss = agg_loss(
-            loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
+            loss_mat=kld, loss_mask=loss_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
         )
 
         policy_loss += kl_loss * config.kl_loss_coef
