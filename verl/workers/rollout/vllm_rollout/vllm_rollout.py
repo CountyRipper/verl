@@ -26,6 +26,7 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -159,7 +160,29 @@ class ServerAdapter(BaseRollout):
             tags: weights or kv_cache.
         """
         if self.config.free_cache_engine and self._ensure_server_handle():
-            await self.server_handle.wake_up.remote(tags=tags)
+            release_file = os.environ.get("VERL_MEMORY_GUARD_RELEASE_FILE")
+            if release_file:
+                try:
+                    release_dir = os.path.dirname(release_file)
+                    if release_dir:
+                        os.makedirs(release_dir, exist_ok=True)
+                    with open(release_file, "w", encoding="utf-8") as f:
+                        f.write(",".join(tags))
+                except OSError as exc:
+                    logger.warning("Failed to request memory guard release: %s", exc)
+                wait_seconds = float(os.environ.get("VERL_MEMORY_GUARD_RELEASE_WAIT_SECONDS", "3"))
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+            try:
+                await self.server_handle.wake_up.remote(tags=tags)
+            finally:
+                if release_file:
+                    try:
+                        os.unlink(release_file)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        logger.warning("Failed to clear memory guard release request: %s", exc)
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
