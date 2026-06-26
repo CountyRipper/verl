@@ -635,6 +635,431 @@ class RayPPOTrainer:
         denom = mask.sum(dim=-1).clamp_min(1.0)
         return (values * mask).sum(dim=-1) / denom
 
+    def _oats_ablation_config(self):
+        return self.config.trainer.get("oats_ablation", None)
+
+    def _oats_ablation_enabled(self) -> bool:
+        cfg = self._oats_ablation_config()
+        return bool(cfg and cfg.get("enable", False))
+
+    @staticmethod
+    def _oats_rank_pct(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        ranks = np.zeros(values.shape[0], dtype=np.float64)
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            return ranks
+        finite_values = values[finite]
+        order = np.argsort(finite_values, kind="mergesort")
+        sorted_values = finite_values[order]
+        unique_values, first_indices = np.unique(sorted_values, return_index=True)
+        denom = max(finite_values.shape[0] - 1, 1)
+        value_to_rank = {
+            float(value): float(first_idx / denom)
+            for value, first_idx in zip(unique_values, first_indices, strict=True)
+        }
+        ranks[finite] = np.asarray([value_to_rank[float(value)] for value in finite_values], dtype=np.float64)
+        return ranks
+
+    @staticmethod
+    def _oats_entropy_edges(raw) -> np.ndarray:
+        if raw is None:
+            raw = "0,0.5,1,1.5,2,3,4,6"
+        if isinstance(raw, str):
+            values = [float(item.strip()) for item in raw.split(",") if item.strip()]
+        else:
+            values = [float(item) for item in raw]
+        values = sorted(set(values))
+        if not values or values[0] > 0:
+            values.insert(0, 0.0)
+        if values[-1] != float("inf"):
+            values.append(float("inf"))
+        return np.asarray(values, dtype=np.float64)
+
+    @staticmethod
+    def _oats_topk_mask(scores: np.ndarray, target_count: int) -> np.ndarray:
+        scores = np.asarray(scores, dtype=np.float64)
+        mask = np.zeros(scores.shape[0], dtype=bool)
+        if scores.size == 0 or target_count <= 0:
+            return mask
+        if target_count >= scores.size:
+            mask[:] = True
+            return mask
+        safe_scores = np.where(np.isfinite(scores), scores, -np.inf)
+        idx = np.argpartition(safe_scores, -target_count)[-target_count:]
+        mask[idx] = True
+        return mask
+
+    def _oats_compute_delta_scores_for_ablation(self, batch: DataProto) -> torch.Tensor:
+        from verl.workers.utils.delta import build_delta_weighted_advantages
+
+        batch_td = batch.to_tensordict()
+        batch_td = left_right_2_no_padding(batch_td)
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=False,
+            compute_loss=False,
+            return_delta_hidden=True,
+        )
+        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        log_probs = tu.get(output, "log_probs")
+        hidden_states = tu.get(output, "delta_hidden_states")
+        if hidden_states is None:
+            raise RuntimeError("isolated_delta_top_token requires delta_hidden_states, but actor output did not return it")
+        actor_cfg = self.config.actor_rollout_ref.actor
+        delta_tensors, _ = build_delta_weighted_advantages(
+            log_probs=log_probs,
+            hidden_states=hidden_states,
+            data=batch_td,
+            num_iters=int(actor_cfg.get("delta_K", 1)),
+            lam_min=float(actor_cfg.get("delta_lam_min", 0.8)),
+            lam_max=float(actor_cfg.get("delta_lam_max", 1.2)),
+            impl=str(actor_cfg.get("delta_impl", "Normal")),
+        )
+        return delta_tensors["delta_scores"].detach().cpu()
+
+    def _oats_apply_ablation_mask(
+        self,
+        batch: DataProto,
+        entropys: Optional[torch.Tensor],
+        delta_scores: Optional[torch.Tensor] = None,
+    ) -> dict[str, float]:
+        cfg = self._oats_ablation_config()
+        if not cfg or not cfg.get("enable", False):
+            return {}
+
+        mode = str(cfg.get("mode", "dense_delta"))
+        ratio = float(cfg.get("mask_ratio", 1.0))
+        b_g_min = float(cfg.get("b_g_min", 0.0))
+        dense_anchor = float(cfg.get("dense_anchor", 0.0))
+        score_mode = str(cfg.get("score_mode", "high_residual_rank"))
+        polarity = str(cfg.get("polarity", "advantage"))
+        counterpart_constraint = bool(cfg.get("counterpart_constraint", True))
+        template_cutoff = int(cfg.get("template_token_cutoff", 64))
+        random_seed = int(cfg.get("random_seed", 42))
+        entropy_edges = self._oats_entropy_edges(cfg.get("entropy_bands", None))
+        eps = 1e-12
+
+        response_mask_t = batch.batch["response_mask"]
+        device = response_mask_t.device
+        response_mask = response_mask_t.detach().cpu().bool().numpy()
+        valid_flat = response_mask.reshape(-1)
+        valid_count = int(valid_flat.sum())
+        weights_flat = np.zeros(valid_flat.shape[0], dtype=np.float32)
+        if valid_count == 0:
+            batch.batch["oats_loss_weights"] = torch.zeros_like(response_mask_t, dtype=torch.float32)
+            return {"oats_ablation/valid_token_count": 0.0}
+
+        response_len = response_mask.shape[1]
+        prompt_ids, _ = self._oats_prompt_and_rollout_ids(batch)
+        prompt_flat = np.repeat(prompt_ids.astype(np.int64), response_len)
+        position_flat = np.tile(np.arange(response_len, dtype=np.int64), len(prompt_ids))
+        token_flat = batch.batch["responses"].detach().cpu().numpy().reshape(-1)
+        advantage_flat = batch.batch["advantages"].detach().cpu().float().numpy().reshape(-1)
+        delta_score_flat = None
+        if delta_scores is not None:
+            delta_score_flat = delta_scores.float().numpy().reshape(-1)
+        if entropys is None:
+            entropy_flat = np.zeros(valid_flat.shape[0], dtype=np.float32)
+        else:
+            entropy_flat = entropys.detach().cpu().float().numpy().reshape(-1)
+        rewards = batch.batch["token_level_scores"].detach().cpu().float().sum(dim=-1).numpy()
+        reward_flat = np.repeat(rewards.astype(np.float32), response_len)
+
+        valid_indices = np.where(valid_flat)[0]
+        target_count = int(round(valid_count * ratio))
+        if ratio > 0:
+            target_count = max(1, min(valid_count, target_count))
+        else:
+            target_count = 0
+
+        selected_valid = np.zeros(valid_count, dtype=bool)
+        fallback_valid = np.zeros(valid_count, dtype=bool)
+
+        valid_advantage = advantage_flat[valid_indices]
+        valid_entropy = entropy_flat[valid_indices]
+        valid_reward = reward_flat[valid_indices]
+        valid_position = position_flat[valid_indices]
+
+        selected_group_ids = np.asarray([], dtype=np.int64)
+        fallback_group_ids = np.asarray([], dtype=np.int64)
+        group_ids_for_valid = np.asarray([], dtype=np.int64)
+        group_count = np.asarray([], dtype=np.float64)
+        group_pos_mass = np.asarray([], dtype=np.float64)
+        group_neg_mass = np.asarray([], dtype=np.float64)
+        group_mass = np.asarray([], dtype=np.float64)
+        group_b_g = np.asarray([], dtype=np.float64)
+        group_eligible = np.asarray([], dtype=bool)
+        group_positive_mask = np.asarray([], dtype=bool)
+        group_negative_mask = np.asarray([], dtype=bool)
+
+        complete_group_modes = {"random_complete_group", "oats_complete_group", "oats_no_counterpart"}
+        if mode in complete_group_modes:
+            valid_prompt = prompt_flat[valid_indices]
+            valid_token = token_flat[valid_indices]
+            band_idx = np.searchsorted(entropy_edges[1:-1], valid_entropy, side="right")
+            band_idx = np.clip(band_idx, 0, len(entropy_edges) - 2).astype(np.int64)
+
+            group_map: dict[tuple[int, int, int], int] = {}
+            group_ids_for_valid = np.empty(valid_count, dtype=np.int64)
+            for i, key in enumerate(zip(valid_prompt, valid_token, band_idx, strict=True)):
+                group_key = (int(key[0]), int(key[1]), int(key[2]))
+                group_id = group_map.get(group_key)
+                if group_id is None:
+                    group_id = len(group_map)
+                    group_map[group_key] = group_id
+                group_ids_for_valid[i] = group_id
+
+            num_groups = len(group_map)
+            token_mass = np.abs(valid_advantage)
+            if polarity == "reward":
+                group_positive_mask = valid_reward > 0
+                group_negative_mask = valid_reward <= 0
+            else:
+                group_positive_mask = valid_advantage > 0
+                group_negative_mask = valid_advantage < 0
+
+            group_count = np.bincount(group_ids_for_valid, minlength=num_groups).astype(np.float64)
+            group_pos_count = np.bincount(
+                group_ids_for_valid, weights=group_positive_mask.astype(np.float64), minlength=num_groups
+            )
+            group_neg_count = np.bincount(
+                group_ids_for_valid, weights=group_negative_mask.astype(np.float64), minlength=num_groups
+            )
+            group_pos_mass = np.bincount(
+                group_ids_for_valid, weights=token_mass * group_positive_mask, minlength=num_groups
+            )
+            group_neg_mass = np.bincount(
+                group_ids_for_valid, weights=token_mass * group_negative_mask, minlength=num_groups
+            )
+            group_mass = np.bincount(group_ids_for_valid, weights=token_mass, minlength=num_groups)
+            residual_credit = np.bincount(group_ids_for_valid, weights=valid_advantage, minlength=num_groups)
+            total_counterpart_mass = group_pos_mass + group_neg_mass
+            group_b_g = 2.0 * np.minimum(group_pos_mass, group_neg_mass) / (total_counterpart_mass + eps)
+            rho_g = np.abs(residual_credit) / (group_mass + eps)
+            group_eligible = (group_pos_count > 0) & (group_neg_count > 0)
+
+            if score_mode == "low_residual":
+                group_score = group_b_g * group_mass * np.maximum(0.0, 1.0 - rho_g)
+            elif score_mode == "high_residual_rank":
+                group_score = (
+                    0.45 * self._oats_rank_pct(rho_g)
+                    + 0.35 * self._oats_rank_pct(group_b_g)
+                    + 0.20 * self._oats_rank_pct(group_mass)
+                )
+            else:
+                raise ValueError(f"Unsupported OATS ablation score_mode: {score_mode}")
+
+            if mode == "random_complete_group":
+                rng = np.random.default_rng(random_seed + int(self.global_steps))
+                order = np.arange(num_groups, dtype=np.int64)
+                rng.shuffle(order)
+                primary_order_count = len(order)
+            else:
+                if mode == "oats_no_counterpart":
+                    primary = np.isfinite(group_score) & (group_count > 0)
+                elif counterpart_constraint:
+                    primary = (
+                        np.isfinite(group_score)
+                        & (group_count > 0)
+                        & group_eligible
+                        & (group_b_g >= b_g_min)
+                    )
+                else:
+                    primary = np.isfinite(group_score) & (group_count > 0) & (group_b_g >= b_g_min)
+                fallback = np.isfinite(group_score) & (group_count > 0) & ~primary
+                order = np.where(primary)[0][np.argsort(-group_score[primary], kind="mergesort")]
+                fallback_order = np.where(fallback)[0][np.argsort(-group_score[fallback], kind="mergesort")]
+                primary_order_count = len(order)
+                order = np.concatenate([order, fallback_order])
+
+            retained = 0
+            selected_groups = []
+            fallback_groups = []
+            for group_id in order:
+                selected_groups.append(int(group_id))
+                if mode != "random_complete_group" and len(selected_groups) > primary_order_count:
+                    fallback_groups.append(int(group_id))
+                retained += int(group_count[group_id])
+                if retained >= target_count:
+                    break
+            selected_group_ids = np.asarray(selected_groups, dtype=np.int64)
+            fallback_group_ids = np.asarray(fallback_groups, dtype=np.int64)
+            selected_valid = np.isin(group_ids_for_valid, selected_group_ids)
+            if fallback_group_ids.size:
+                fallback_valid = np.isin(group_ids_for_valid, fallback_group_ids)
+        elif mode == "dense_delta":
+            selected_valid[:] = True
+        elif mode == "isolated_delta_top_token":
+            if delta_score_flat is None:
+                raise RuntimeError("isolated_delta_top_token requires precomputed DelTA scores")
+            scores = np.abs(delta_score_flat[valid_indices])
+            selected_valid = self._oats_topk_mask(scores, target_count)
+        elif mode == "high_entropy_token":
+            selected_valid = self._oats_topk_mask(valid_entropy, target_count)
+        else:
+            raise ValueError(f"Unsupported OATS ablation mode: {mode}")
+
+        selected_flat = np.zeros(valid_flat.shape[0], dtype=bool)
+        fallback_flat = np.zeros(valid_flat.shape[0], dtype=bool)
+        selected_flat[valid_indices] = selected_valid
+        fallback_flat[valid_indices] = fallback_valid
+
+        if group_ids_for_valid.size == 0:
+            valid_prompt = prompt_flat[valid_indices]
+            valid_token = token_flat[valid_indices]
+            band_idx = np.searchsorted(entropy_edges[1:-1], valid_entropy, side="right")
+            band_idx = np.clip(band_idx, 0, len(entropy_edges) - 2).astype(np.int64)
+            group_map: dict[tuple[int, int, int], int] = {}
+            group_ids_for_valid = np.empty(valid_count, dtype=np.int64)
+            for i, key in enumerate(zip(valid_prompt, valid_token, band_idx, strict=True)):
+                group_key = (int(key[0]), int(key[1]), int(key[2]))
+                group_id = group_map.get(group_key)
+                if group_id is None:
+                    group_id = len(group_map)
+                    group_map[group_key] = group_id
+                group_ids_for_valid[i] = group_id
+            num_groups = len(group_map)
+            token_mass = np.abs(valid_advantage)
+            if polarity == "reward":
+                group_positive_mask = valid_reward > 0
+                group_negative_mask = valid_reward <= 0
+            else:
+                group_positive_mask = valid_advantage > 0
+                group_negative_mask = valid_advantage < 0
+            group_count = np.bincount(group_ids_for_valid, minlength=num_groups).astype(np.float64)
+            group_pos_count = np.bincount(
+                group_ids_for_valid, weights=group_positive_mask.astype(np.float64), minlength=num_groups
+            )
+            group_neg_count = np.bincount(
+                group_ids_for_valid, weights=group_negative_mask.astype(np.float64), minlength=num_groups
+            )
+            group_pos_mass = np.bincount(
+                group_ids_for_valid, weights=token_mass * group_positive_mask, minlength=num_groups
+            )
+            group_neg_mass = np.bincount(
+                group_ids_for_valid, weights=token_mass * group_negative_mask, minlength=num_groups
+            )
+            group_mass = np.bincount(group_ids_for_valid, weights=token_mass, minlength=num_groups)
+            total_counterpart_mass = group_pos_mass + group_neg_mass
+            group_b_g = 2.0 * np.minimum(group_pos_mass, group_neg_mass) / (total_counterpart_mass + eps)
+            group_eligible = (group_pos_count > 0) & (group_neg_count > 0)
+
+        raw_weights = np.zeros(valid_flat.shape[0], dtype=np.float32)
+        raw_weights[valid_flat] = float(dense_anchor)
+        raw_weights[selected_flat] = 1.0
+        mean_weight = float(raw_weights[valid_flat].mean()) if valid_count else 0.0
+        if mean_weight > 0:
+            weights_flat = raw_weights / mean_weight
+        weights = torch.from_numpy(weights_flat.reshape(response_mask.shape)).to(device=device, dtype=torch.float32)
+        batch.batch["oats_loss_weights"] = weights
+
+        selected_count = int(selected_valid.sum())
+        selected_ratio = float(selected_count / valid_count) if valid_count else 0.0
+        fallback_token_ratio = float(fallback_valid.sum() / selected_count) if selected_count else 0.0
+        selected_adv = valid_advantage[selected_valid]
+        selected_entropy = valid_entropy[selected_valid]
+        selected_position = valid_position[selected_valid]
+        template = selected_position < template_cutoff
+        reasoning = ~template
+
+        metrics = {
+            "oats_ablation/selected_token_ratio": selected_ratio,
+            "oats_ablation/loss_weight_mean": float(weights_flat[valid_flat].mean()) if valid_count else 0.0,
+            "oats_ablation/loss_weight_nonzero_ratio": float((weights_flat[valid_flat] > 0).mean()),
+            "oats_ablation/fallback_token_ratio": fallback_token_ratio,
+            "oats_ablation/objective_mass": float(np.abs(selected_adv).sum() / max(valid_count, 1)),
+            "oats_ablation/signed_credit": float(selected_adv.sum() / max(selected_count, 1)),
+            "oats_ablation/template_token_share": float(template.mean()) if selected_count else 0.0,
+            "oats_ablation/reasoning_token_share": float(reasoning.mean()) if selected_count else 0.0,
+            "oats_ablation/template_objective_mass": float(np.abs(selected_adv[template]).mean()) if np.any(template) else 0.0,
+            "oats_ablation/reasoning_objective_mass": float(np.abs(selected_adv[reasoning]).mean()) if np.any(reasoning) else 0.0,
+            "oats_ablation/mean_entropy_selected": float(selected_entropy.mean()) if selected_count else 0.0,
+            "oats_ablation/uses_delta_scores": float(mode == "isolated_delta_top_token"),
+        }
+
+        if group_ids_for_valid.size:
+            num_groups = int(group_count.shape[0])
+            selected_float = selected_valid.astype(np.float64)
+            selected_count_by_group = np.bincount(group_ids_for_valid, weights=selected_float, minlength=num_groups)
+            selected_pos_count = np.bincount(
+                group_ids_for_valid,
+                weights=selected_float * group_positive_mask.astype(np.float64),
+                minlength=num_groups,
+            )
+            selected_neg_count = np.bincount(
+                group_ids_for_valid,
+                weights=selected_float * group_negative_mask.astype(np.float64),
+                minlength=num_groups,
+            )
+            selected_pos_mass = np.bincount(
+                group_ids_for_valid,
+                weights=selected_float * np.abs(valid_advantage) * group_positive_mask,
+                minlength=num_groups,
+            )
+            selected_neg_mass = np.bincount(
+                group_ids_for_valid,
+                weights=selected_float * np.abs(valid_advantage) * group_negative_mask,
+                minlength=num_groups,
+            )
+            selected_mass = selected_pos_mass + selected_neg_mass
+            b_after = 2.0 * np.minimum(selected_pos_mass, selected_neg_mass) / (selected_mass + eps)
+            retained_eligible = group_eligible & (selected_count_by_group > 0)
+            broken = retained_eligible & ((selected_pos_count == 0) | (selected_neg_count == 0))
+            pair_mass = np.minimum(group_pos_mass, group_neg_mass)
+            pair_total = float(pair_mass[group_eligible].sum())
+            if pair_total > 0:
+                pos_retention = selected_pos_mass / (group_pos_mass + eps)
+                neg_retention = selected_neg_mass / (group_neg_mass + eps)
+                leakage = float((np.abs(pos_retention - neg_retention) * pair_mass)[group_eligible].sum() / pair_total)
+            else:
+                leakage = 0.0
+            valid_weight = selected_mass > 0
+            metrics.update(
+                {
+                    "oats_ablation/selected_group_ratio": float((selected_count_by_group > 0).sum() / max(num_groups, 1)),
+                    "oats_ablation/fallback_group_ratio": float(fallback_group_ids.size / max(selected_group_ids.size, 1)),
+                    "oats_ablation/B_G_before": float(np.average(group_b_g[group_mass > 0], weights=group_mass[group_mass > 0]))
+                    if np.any(group_mass > 0)
+                    else 0.0,
+                    "oats_ablation/B_G_after": float(np.average(b_after[valid_weight], weights=selected_mass[valid_weight]))
+                    if np.any(valid_weight)
+                    else 0.0,
+                    "oats_ablation/counterpart_break_rate": float(broken.sum() / max(retained_eligible.sum(), 1)),
+                    "oats_ablation/cancellation_leakage": leakage,
+                    "oats_ablation/eligible_group_ratio": float(group_eligible.sum() / max(num_groups, 1)),
+                    "oats_ablation/primary_group_count": float(selected_group_ids.size - fallback_group_ids.size),
+                    "oats_ablation/fallback_group_count": float(fallback_group_ids.size),
+                }
+            )
+        else:
+            metrics.update(
+                {
+                    "oats_ablation/selected_group_ratio": 0.0,
+                    "oats_ablation/fallback_group_ratio": 0.0,
+                    "oats_ablation/B_G_before": 0.0,
+                    "oats_ablation/B_G_after": 0.0,
+                    "oats_ablation/counterpart_break_rate": 0.0,
+                    "oats_ablation/cancellation_leakage": 0.0,
+                    "oats_ablation/eligible_group_ratio": 0.0,
+                    "oats_ablation/primary_group_count": 0.0,
+                    "oats_ablation/fallback_group_count": 0.0,
+                }
+            )
+
+        if selected_count:
+            band_idx = np.searchsorted(entropy_edges[1:-1], selected_entropy, side="right")
+            band_idx = np.clip(band_idx, 0, len(entropy_edges) - 2).astype(np.int64)
+            band_counts = np.bincount(band_idx, minlength=len(entropy_edges) - 1)
+            for i, count in enumerate(band_counts):
+                low = entropy_edges[i]
+                high = entropy_edges[i + 1]
+                high_label = "inf" if np.isinf(high) else str(high).replace(".", "p")
+                low_label = str(low).replace(".", "p")
+                metrics[f"oats_ablation/entropy_band_{low_label}_{high_label}"] = float(count / selected_count)
+
+        return metrics
+
     def _oats_log_rollout_summary(self, batch: DataProto) -> dict[str, float]:
         cfg = self._oats_diagnostics_config()
         output_dir = self._oats_diagnostics_output_dir(cfg)
@@ -1941,6 +2366,20 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                    if self._oats_ablation_enabled():
+                        with marked_timer("oats_ablation_mask", timing_raw, color="green"):
+                            oats_delta_scores = None
+                            oats_ablation_cfg = self._oats_ablation_config()
+                            if str(oats_ablation_cfg.get("mode", "")) == "isolated_delta_top_token":
+                                oats_delta_scores = self._oats_compute_delta_scores_for_ablation(batch)
+                            metrics.update(
+                                self._oats_apply_ablation_mask(
+                                    batch,
+                                    old_entropys_for_diag,
+                                    delta_scores=oats_delta_scores,
+                                )
+                            )
 
                     if oats_diag_enabled:
                         with marked_timer("oats_rollout_summary", timing_raw, color="green"):
